@@ -1,4 +1,5 @@
 use std::{io, collections::HashMap};
+use std::collections::hash_map::Entry;
 use std::net::Ipv4Addr;
 use etherparse::{ Ipv4HeaderSlice, IpNumber, TcpHeaderSlice};
 
@@ -37,15 +38,28 @@ fn main()->io::Result<()> {
                     //not TCP
                     continue;
                 }
-
+                
                 match TcpHeaderSlice::from_slice(&buf[4+iph.slice().len()..nbytes]) {
                     Ok(tcph)=>{
+
                         let datai = 4 + iph.slice().len() + tcph.slice().len();
-                        connections.entry(Quad {
+                        match connections.entry(Quad {
                             src: (src,tcph.source_port()),
                             dst: (dst,tcph.destination_port()) 
-                        }).or_default().on_packet(&mut nic,iph,tcph,&buf[datai..nbytes])?;
-                      
+                        }){
+                            Entry::Occupied(mut c)=> {
+                                c.get_mut().on_packet(&mut nic,iph,tcph,&buf[datai..nbytes])?;
+                            },
+                            Entry::Vacant(mut e) => {
+                                if let Some(c) = tcp::Connection::accept(&mut nic,
+                                        iph,
+                                        tcph, 
+                                        &buf[datai..nbytes]
+                                    )?{
+                                    e.insert(c);
+                                }
+                            }
+                        }                     
                     }
                     Err(e)=>{
                         eprintln!("Ignoring wierd TCP packet Err:{}",e);
