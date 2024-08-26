@@ -107,12 +107,20 @@ impl Connection{
             
         ){
             Ok(h)=>{
+
+                syn_ack.checksum = syn_ack.calc_checksum_ipv4(&h, &[])
+                    .expect("failed to set checksum");
+                eprintln!("ip header: {:02x?}",iph);
+                eprintln!("tcp header: {:02x?}",tcph);
+
                 let unwritten = {
                     let mut unwritten = &mut buf[..];
                     h.write(&mut unwritten)?;
                     syn_ack.write(&mut unwritten)?;
                     unwritten.len()
                 };
+
+                eprintln!("responding with {:02x?}",&buf[..buf.len()-unwritten]);
                 nic.send(&buf[..unwritten])?;
 
             },
@@ -133,7 +141,7 @@ impl Connection{
         tcph:TcpHeaderSlice<'a>,
         data:&[u8]
     )->io::Result<()>{
-        unimplemented!();
+        Ok(())
     }
 
 
