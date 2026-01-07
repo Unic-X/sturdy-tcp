@@ -69,7 +69,7 @@ fn main()->io::Result<()> {
                
             },
             Err(e) => {
-                eprintln!("{}",e);
+                eprintln!("IP packet error: {}", e);
             }
             
         }

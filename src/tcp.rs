@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, io};
+use std::{cmp::Ordering, io, iter::StepBy};
 
 use etherparse::{ip_number, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
@@ -7,6 +7,18 @@ pub enum State {
     //Listen,
     SynRcvd,
     Estab,
+    FinWait1,
+    Closing,
+    TimeWait,
+}
+
+impl State {
+    fn is_synchronized(&self) -> bool {
+        match self {
+            State::SynRcvd => false, 
+            State::Estab | State::FinWait1 | State::Closing | State::TimeWait => true,
+        }
+    }
 }
 
 pub struct Connection {
@@ -14,6 +26,7 @@ pub struct Connection {
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
     ip: etherparse::Ipv4Header,
+    tcp: etherparse::TcpHeader,
 }
 
 struct SendSequenceSpace {
@@ -45,6 +58,47 @@ struct RecvSequenceSpace {
 }
 
 impl Connection {
+    pub fn write(
+        &mut self,
+        nic: &mut tun_tap::Iface,
+        payload: &[u8]
+    ) -> io::Result<usize>{
+        let mut buf = [0u8; 1500];
+        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.acknowledgment_number = self.recv.nxt;
+
+        let size = std::cmp::min(
+            buf.len(), payload.len() + self.tcp.header_len() + self.ip.header_len()
+        );
+
+        self.ip.set_payload_len(size);
+
+        // TODO: serialize TCP header and IP header to buffer and send via NIC
+        // For now, just return the payload length
+        
+        use std::io::Write;
+        let mut unwritten = &mut buf[..]; // Here unwritten is a mutable slice
+        self.ip.write(&mut unwritten); // Now ipv4 header is written onto the buffer and write pointer
+                                     // moves forward
+        self.tcp.write(&mut unwritten); // Again TCP header is added and pointer moves forward
+        let payload_bytes = unwritten.write(payload)?;                            // without overlapping
+        let unwritten = unwritten.len();
+        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
+
+        if self.tcp.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+        if self.tcp.fin{
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.fin = false;
+        }
+
+        nic.send(&buf[..buf.len() - unwritten])?;
+
+        Ok(payload_bytes)
+    }
+
     pub fn accept<'a>(
         nic: &mut tun_tap::Iface,
         iph: Ipv4HeaderSlice<'a>,
@@ -61,18 +115,20 @@ impl Connection {
 
         // keep track of sender info
         let iss = 0;
+        let wnd = 10;
         let mut c = Connection {
             state: State::SynRcvd,
             send: SendSequenceSpace {
                 iss,
                 una: iss,
                 nxt: iss + 1,
-                wnd: 10,
+                wnd: wnd,
                 up: false,
 
                 wl1: 0,
                 wl2: 0,
             },
+            tcp: etherparse::TcpHeader::new(tcph.source_port(), tcph.destination_port(), iss, wnd),
             recv: RecvSequenceSpace {
                 irs: tcph.sequence_number(),
                 nxt: tcph.sequence_number() + 1,
@@ -99,31 +155,22 @@ impl Connection {
 
         //decide on the stuff we are sending them
 
-        let mut syn_ack = TcpHeader::new(
-            tcph.destination_port(),
-            tcph.source_port(),
-            c.send.iss,
-            c.send.wnd,
-        );
-        syn_ack.acknowledgment_number = c.recv.nxt;
+        c.tcp.syn = true;
+        c.tcp.ack = true;
+        c.write(nic, &[])?;
 
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        c.ip.set_payload_len(syn_ack.header_len() + 0);
-
-        let unwritten = {
-            let mut unwritten = &mut buf[..]; // Here unwritten is a mutable slice
-            c.ip.write(&mut unwritten)?; // Now ipv4 header is written onto the buffer and write pointer
-                                         // moves forward
-            syn_ack.write(&mut unwritten)?; // Again TCP header is added and pointer moves forward
-                                            // without overlapping
-            unwritten.len() // Return the written length i.e how much is written
-        };
-
-        nic.send(&buf[..unwritten])?; // Send written data to the ethernet
-
-        //Write out the header
         Ok(Some(c)) // Return the connection
+    }
+
+    pub fn send_rst(
+        &mut self,
+        nic: &mut tun_tap::Iface,
+    ) -> io::Result<()> {
+        self.tcp.rst = true;
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.write(nic, &[])?;
+        Ok(())
     }
 
     pub fn on_packet<'a>(
@@ -140,19 +187,21 @@ impl Connection {
         let ackn = tcph.acknowledgment_number();
 
         if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-            return Ok(());
+
+            // if we're not synchronized, return a RST
+            if !self.state.is_synchronized() { 
+                // self.tcp.sequence_number = tcph.acknowledgment_number();
+                self.send_rst(nic);
+                return Ok(());
+            }
         }
 
         let seqn = tcph.sequence_number();
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
         let mut slen = data.len() as u32;
         
-        if tcph.fin() {
-            slen +=1;
-        }
-
-        if tcph.syn() {
-            slen +=1;
+        if tcph.fin() || tcph.syn() {
+            slen += 1;
         }
 
         if slen == 0 {
@@ -180,9 +229,43 @@ impl Connection {
         match self.state {
             State::SynRcvd => {
                 //expect to get an ACK for our SYN
+                if !tcph.ack() {
+                    return Ok(());
+                }
+                //verify the acknowledgment number matches what we expect
+                if ackn != self.send.nxt {
+                    return Ok(());
+                }
+
+                
+                self.state = State::Estab;
+                println!("Connection established");
+
+                 // terminate the connection for now
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+
+                self.state = State::FinWait1;
+                println!("Connection terminated - moving to FinWait1");
+                return Ok(());
             }
             State::Estab => {
-                unimplemented!()
+                unimplemented!();
+            }
+            State::FinWait1 => {
+                if !tcph.fin() || !data.is_empty(){
+                    // Not a FIN packet, ignore
+                    unimplemented!()
+                }
+                // Handle FIN packet
+
+                self.tcp.fin = false;
+                self.write(nic, &[])?;
+                self.state = State::TimeWait;
+            }
+            _ => {
+                // Ignore other states for now
+                println!("Ignoring packet in state: {}", stringify!(self.state));
             }
         }
         Ok(())

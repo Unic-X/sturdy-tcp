@@ -8,7 +8,7 @@ fi
 
 sudo setcap cap_net_admin=eip ./target/release/pct
 
-./target/release/pct & 
+./target/release/pct &
 
 pid=$!
 
